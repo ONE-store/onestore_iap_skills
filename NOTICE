@@ -1,0 +1,23 @@
+=========================================================================
+  ONEstore IAP Skills
+  Copyright (c) 2026 One store Co., Ltd.
+=========================================================================
+
+This product includes an Agent Skill bundle for integrating OneStore
+In-App Purchase, developed by One store Co., Ltd.
+
+This repository is licensed under the OneStore IAP SDK License
+Agreement. See the LICENSE file for the full terms.
+
+-----------------------------------------------------------------------------
+This product references the OneStore IAP SDK.
+-----------------------------------------------------------------------------
+
+  OneStore IAP SDK (com.gaa.sdk.iap)
+  Copyright (c) 2021-2026 OneStore Co., Ltd. All Rights Reserved.
+
+  This repository does not contain the SDK binaries. The SDK is
+  distributed via Maven Central and is provided under the OneStore
+  IAP SDK License Agreement. Full license text:
+
+  https://m.onestore.co.kr/common/license/ONESTORE_IAP_SDK_LICENSE.html

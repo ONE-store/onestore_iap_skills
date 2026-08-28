@@ -1,0 +1,573 @@
+package __PACKAGE__
+
+import android.app.Activity
+import android.content.Context
+import android.content.pm.ApplicationInfo
+import android.util.Log
+import com.gaa.sdk.auth.GaaSignInClient
+import com.gaa.sdk.base.Logger
+import com.gaa.sdk.iap.AcknowledgeParams
+import com.gaa.sdk.iap.ConsumeParams
+import com.gaa.sdk.iap.IapResult
+import com.gaa.sdk.iap.ProductDetail
+import com.gaa.sdk.iap.ProductDetailsParams
+import com.gaa.sdk.iap.PurchaseClient
+import com.gaa.sdk.iap.PurchaseClient.ConnectionState
+import com.gaa.sdk.iap.PurchaseClient.ProductType
+import com.gaa.sdk.iap.PurchaseClient.ResponseCode
+import com.gaa.sdk.iap.PurchaseClientStateListener
+import com.gaa.sdk.iap.PurchaseData
+import com.gaa.sdk.iap.PurchaseFlowParams
+import com.gaa.sdk.iap.PurchasesUpdatedListener
+
+/**
+ * 원스토어 인앱결제(IAP) 연동 매니저.
+ *
+ * sdk-iap 21.04.00 기준으로 작성됐고, 공개 샘플 앱(github.com/ONE-store/onestore_iap_release)의
+ * 구현 패턴을 따릅니다. SDK와 안드로이드 프레임워크 외에는 아무것도 의존하지 않습니다.
+ *
+ * ## 사용 순서
+ * 1. 액티비티 생성 시 [start] 호출 — 서비스 연결과 상품 조회가 시작됩니다
+ * 2. **액티비티 `onResume` 에서 [onResumed] 호출** — 후처리를 못 한 구매를 회수합니다.
+ *    빠뜨리면 백그라운드에서 돌아온 경우가 회수되지 않아 **3일 뒤 자동 환불**로 이어집니다
+ * 3. [launchPurchase] 로 결제창을 띄웁니다
+ * 4. 결과는 [Listener] 로 전달됩니다
+ * 5. 액티비티 종료 시 [release] 호출
+ *
+ * ## 로그 보기
+ * 디버그 빌드에서 진행 상황을 `OneStoreIAP` 태그로 출력합니다. 릴리즈 빌드에서는 경고·오류만
+ * 남습니다.
+ * ```
+ * adb logcat -s OneStoreIAP
+ * ```
+ *
+ * ## 반드시 확인할 TODO
+ * - `OneStoreLicenseKey` — 발급받은 라이선스 키를 인코딩해 채운다 (평문 상수로 두지 않는다)
+ * - [PRODUCT_IDS] — 개발자센터에 등록한 실제 상품 ID
+ * - [CONSUMABLE_PRODUCT_IDS] — **관리형 상품 중 소비성인 것.** 잘못 고르면 오류 없이 조용히 깨진다
+ * - [Listener.onPurchaseCompleted] 구현 — 상품 지급. **중복 지급 방지를 함께 넣으세요**
+ *
+ * 문서: https://onestore-dev.gitbook.io/dev
+ */
+class OneStorePurchaseManager(
+    private val context: Context,
+    private val listener: Listener,
+    /**
+     * 구매가 완료되면 소비·승인을 자동으로 수행할지 여부입니다.
+     *
+     * 운영 코드에서는 `true`(기본값)로 둡니다 — 3일 안에 후처리하지 않으면 자동 환불되므로
+     * 미루면 안 됩니다. `false`로 두면 후처리를 하지 않고 [Listener.onPurchasesNeedProcessing]
+     * 으로만 알리며, **테스트 화면에서 소비·승인을 직접 눌러 확인할 때만** 씁니다.
+     */
+    private val autoProcessPurchases: Boolean = true,
+) : PurchasesUpdatedListener {
+
+    /** 결제 진행 결과를 앱에 알립니다. */
+    interface Listener {
+        /** 상품 정보 조회 완료 */
+        fun onProductsLoaded(products: List<ProductDetail>)
+
+        /**
+         * 구매가 완료되고 소비/승인까지 끝났습니다.
+         *
+         * 구매 서명은 [start] 에서 넘긴 공개키로 **SDK가 이미 검증합니다.** 위조된 응답은 여기까지
+         * 오지 않으므로 앱에서 검증 코드를 더 넣을 필요는 없습니다.
+         *
+         * TODO: **서버가 계정에 상품을 지급하는 구조라면** 지급 전에 구매 데이터를 앱 서버로 보내
+         *  서버 대 서버 영수증 검증을 거치세요 — 조작된 클라이언트의 "샀다"를 서버가 믿으면 무료
+         *  지급이 됩니다. 앱이 로컬에서만 처리하는 구조라면 해당 없습니다.
+         *  **다만 후처리(소비/승인)는 서버 응답을 기다리며 미루지 마세요** — 3일 규칙이 걸립니다.
+         */
+        fun onPurchaseCompleted(purchase: PurchaseData)
+
+        /** 사용자가 결제를 취소했습니다. 실패 안내를 띄우지 않는 것이 자연스럽습니다. */
+        fun onPurchaseCanceled()
+
+        /**
+         * 그 밖의 오류. 결제 흐름에서 온 값은 `PurchaseClient.ResponseCode` 로 해석합니다
+         * (https://onestore-dev.gitbook.io/dev/tools/billing/v21/references 의 응답 코드 표).
+         *
+         * **한 가지 예외가 있습니다** — [launchLoginFlow] 가 실패하면 `SignInResult.code` 가
+         * 그대로 넘어옵니다. 로그인 코드는 결제 응답 코드와 **체계가 다르므로** 응답 코드 표로
+         * 해석하면 엉뚱한 뜻이 됩니다. 두 경로를 구분해야 한다면 로그인 화면을 띄운 뒤의 실패를
+         * 앱에서 따로 표시해 두세요.
+         */
+        fun onError(responseCode: Int, message: String?)
+
+        /** 원스토어 로그인이 필요합니다 — [launchLoginFlow] 를 호출하세요. */
+        fun onLoginRequired()
+
+        /** 원스토어 앱 설치·업데이트가 필요합니다 — [launchUpdateOrInstallFlow] 를 호출하세요. */
+        fun onUpdateRequired()
+
+        /**
+         * 후처리(소비·승인)가 필요한 구매가 있습니다.
+         *
+         * `autoProcessPurchases = false` 일 때만 호출됩니다. 기본 설정에서는 매니저가 알아서
+         * 처리하므로 구현하지 않아도 됩니다.
+         */
+        fun onPurchasesNeedProcessing(purchases: List<PurchaseData>) {}
+    }
+
+    private companion object {
+        /**
+         * logcat 태그. **결제 관련 파일이 모두 같은 태그를 씁니다** — 매니저·테스트 화면·라이선스
+         * 확인이 한 줄로 다 보입니다(`adb logcat -s OneStoreIAP`). 클래스마다 다른 태그를 쓰면
+         * 흐름이 갈려서 무엇이 먼저 일어났는지 읽기 어려워집니다.
+         */
+        private const val TAG = "OneStoreIAP"
+
+        /** 개발자센터에 등록한 상품 ID. TODO: 실제 상품 ID로 교체하세요. */
+        private val PRODUCT_IDS = listOf("YOUR_PRODUCT_ID")
+
+        /**
+         * 관리형 상품(INAPP) 중 **소비성** 상품의 ID.
+         *
+         * 관리형 상품은 후처리 방식에 따라 성격이 달라집니다.
+         * - 여기에 넣으면 → 구매 후 소비(consume). 코인·물약처럼 **반복 구매**가 가능해집니다
+         * - 넣지 않으면 → 승인(acknowledge)만. 광고 제거·프리미엄 해제처럼 **영구성** 상품이 됩니다
+         *
+         * TODO: 어떤 상품이 소비성인지 채우세요. **영구성 상품을 소비하면 사용자가 다시 구매할 수
+         *  있게 되어 조용히 깨집니다.**
+         */
+        private val CONSUMABLE_PRODUCT_IDS = setOf<String>()
+    }
+
+    /**
+     * 디버그 빌드인지 여부. SDK 내부 로그와 이 매니저의 진행 로그를 **둘 다 이 값으로 켭니다.**
+     *
+     * 매니페스트의 `debuggable` 플래그를 봅니다 — 릴리즈 빌드에서는 꺼지므로 사람이 껐다 켰다 할
+     * 필요가 없습니다. 상수 `true`로 두면 끄는 것을 잊어 결제 로그가 배포본 logcat에 남습니다.
+     *
+     * `BuildConfig.DEBUG`를 쓰고 싶다면 그것도 맞습니다. 다만 `BuildConfig`는 이 파일과 **다른
+     * 패키지**(모듈의 `namespace`)에 생성되므로 import 를 직접 맞춰야 하고, AGP 8부터는
+     * `buildFeatures { buildConfig = true }` 도 필요합니다. 이 플래그 방식은 그 둘 없이 됩니다.
+     */
+    private val isDebugBuild: Boolean
+        get() = (context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
+
+    /**
+     * 진행 상황 로그. **디버그 빌드에서만 출력됩니다.**
+     *
+     * 결제는 실패해도 조용한 경우가 많아(연결이 안 됐거나, 상품 조회가 비었거나, 회수가 건너뛰어졌거나)
+     * **정상 경로를 찍어 두지 않으면 어디까지 갔는지 알 수 없습니다.** 오류만 찍으면 오류가 안 난 채로
+     * 아무 일도 일어나지 않는 상황을 진단할 수 없습니다.
+     *
+     * 기본 로그에는 **구매 토큰(`purchaseToken`)·서명(`signature`)·`originalJson` 을 넣지
+     * 않았습니다** — 상품 ID·상태·응답 코드만으로 어디서 멈췄는지 다 가려집니다.
+     *
+     * 디버깅에 토큰이 필요하면 이 함수로 찍어도 됩니다(디버그 빌드에서만 나갑니다). 다만
+     * **`Log.w`·`Log.e` 는 릴리즈에도 남으므로** 그쪽에는 넣지 마세요.
+     */
+    private fun log(message: String) {
+        if (isDebugBuild) Log.d(TAG, message)
+    }
+
+    private var purchaseClient: PurchaseClient? = null
+
+    /**
+     * 결제창을 띄운 뒤 결과가 돌아오기 전인지. [onResumed] 가 그 사이에 회수를 돌리지 않게 막습니다.
+     *
+     * **결과가 오면 성공·실패·취소 어느 쪽이든 반드시 내려야 합니다** — 켜진 채로 남으면 이후
+     * 포그라운드 복귀에서 회수가 영영 돌지 않습니다.
+     */
+    private var isPurchaseInProgress = false
+
+    /** 상품 ID → 상품 타입. 구매 후처리(소비/승인)를 가르는 데 씁니다. */
+    private val productTypeById = mutableMapOf<String, String>()
+
+    private val isConnected: Boolean
+        get() = purchaseClient?.connectionState == ConnectionState.CONNECTED
+
+    /** 서비스에 연결하고 상품 정보를 조회합니다. 액티비티 생성 시 한 번 호출하세요. */
+    fun start() {
+        Logger.setLogEnable(isDebugBuild)
+        log("start: autoProcessPurchases=$autoProcessPurchases products=${PRODUCT_IDS.size}")
+
+        purchaseClient = PurchaseClient.newBuilder(context)
+            .setBase64PublicKey(OneStoreLicenseKey.get())
+            .setListener(this)
+            .build()
+
+        ensureConnected {
+            queryProductDetails()
+            // 소비되지 않은 관리형 상품이 남아 있으면 여기서 정리합니다.
+            // 테스트 화면(autoProcessPurchases = false)에서는 직접 눌러 확인하도록 건너뜁니다.
+            if (autoProcessPurchases) {
+                queryAndProcessPendingPurchases()
+            }
+        }
+    }
+
+    /**
+     * 원스토어 로그인 상태를 확인합니다. 사용자 조작 없이 조회만 합니다.
+     *
+     * 로그인되어 있지 않으면 [launchLoginFlow] 로 로그인 화면을 띄우세요.
+     */
+    fun checkLogin(activity: Activity, onResult: (Boolean) -> Unit) {
+        GaaSignInClient.getClient(activity).silentSignIn { signInResult ->
+            log("checkLogin: signedIn=${signInResult.isSuccessful}")
+            onResult(signInResult.isSuccessful)
+        }
+    }
+
+    /**
+     * 구매 내역을 **조회만** 합니다. 소비·승인은 하지 않습니다.
+     *
+     * @param productType [ProductType.INAPP] 또는 [ProductType.SUBS]·[ProductType.AUTO].
+     *   [ProductType.ALL] 은 상품 정보 조회 전용이라 여기서는 쓸 수 없습니다.
+     */
+    fun queryPurchases(productType: String, onResult: (List<PurchaseData>) -> Unit) {
+        ensureConnected {
+            purchaseClient?.queryPurchasesAsync(productType) { iapResult, purchases ->
+                if (iapResult.isSuccess) {
+                    log("queryPurchases[$productType]: ${purchases?.size ?: 0}")
+                    onResult(purchases ?: emptyList())
+                } else {
+                    handleError(iapResult)
+                    onResult(emptyList())
+                }
+            }
+        }
+    }
+
+    /** 연결을 끊습니다. 액티비티 종료 시 호출하세요. */
+    fun release() {
+        log("release")
+        purchaseClient?.endConnection()
+        purchaseClient = null
+    }
+
+    /**
+     * 원스토어 서비스 연결을 보장한 뒤 [onReady] 를 실행합니다.
+     *
+     * **연결이 필요한 `PurchaseClient` 호출은 모두 이 함수를 거쳐야 합니다.** 기기 메모리 부족,
+     * OS의 백그라운드 정리, 앱이 백그라운드에서 돌아오는 과정 등으로 명시적인 해제 없이도 연결이
+     * 끊겨 있을 수 있습니다.
+     *
+     * **거치지 않는 것 둘** — 이것을 감싸면 오히려 깨집니다.
+     * - [launchUpdateOrInstallFlow] — 원스토어 앱이 없거나 낡아서 **연결 자체가 성립하지 않는**
+     *   상태의 복구 경로입니다. 감싸면 같은 오류로 떨어져 설치 화면이 영원히 뜨지 않습니다
+     * - `GaaSignInClient` 호출([checkLogin]·[launchLoginFlow]) — `PurchaseClient` 가 아닌 별개
+     *   클라이언트라 연결 개념이 없습니다
+     */
+    private fun ensureConnected(onReady: () -> Unit) {
+        if (isConnected) {
+            onReady()
+            return
+        }
+
+        if (purchaseClient == null) {
+            // start() 를 부르기 전이면 여기로 옵니다. 오류 없이 아무 일도 일어나지 않으므로
+            // 로그가 없으면 원인을 찾을 수 없습니다.
+            Log.w(TAG, "not started — call start() first")
+            return
+        }
+
+        log("connecting...")
+        purchaseClient?.startConnection(object : PurchaseClientStateListener {
+            override fun onSetupFinished(iapResult: IapResult) {
+                if (iapResult.isSuccess) {
+                    log("connected")
+                    onReady()
+                } else {
+                    handleError(iapResult)
+                }
+            }
+
+            override fun onServiceDisconnected() {
+                Log.w(TAG, "onestore service disconnected")
+                // TODO: 진행 중이던 작업이 있으면 사용자에게 알리거나 재시도하세요.
+            }
+        })
+    }
+
+    /** 등록된 상품 정보를 조회합니다. */
+    fun queryProductDetails() {
+        ensureConnected {
+            val params = ProductDetailsParams.newBuilder()
+                .setProductIdList(PRODUCT_IDS)
+                .setProductType(ProductType.ALL)
+                .build()
+
+            purchaseClient?.queryProductDetailsAsync(params) { iapResult, productDetails ->
+                if (!iapResult.isSuccess) {
+                    handleError(iapResult)
+                    return@queryProductDetailsAsync
+                }
+
+                val products = productDetails ?: emptyList()
+                products.forEach { productTypeById[it.productId] = it.type }
+
+                if (products.isEmpty()) {
+                    // 흔한 실패이고 오류가 아닙니다 — 개발자센터에 상품이 없거나, 상품 ID가
+                    // 다르거나, 아직 판매 중이 아닌 경우입니다. 화면이 그냥 비어 보입니다.
+                    Log.w(TAG, "no products for ${PRODUCT_IDS.joinToString()} — check ids/registration")
+                } else {
+                    log("products loaded: " + products.joinToString { "${it.productId}(${it.type})" })
+                }
+                listener.onProductsLoaded(products)
+            }
+        }
+    }
+
+    /**
+     * 결제창을 띄웁니다. 실제 결제 결과는 [onPurchasesUpdated] 로 전달됩니다.
+     *
+     * @param productType [ProductType.INAPP] · [ProductType.SUBS] · [ProductType.AUTO]
+     */
+    fun launchPurchase(
+        activity: Activity,
+        productId: String,
+        productType: String = ProductType.INAPP,
+        quantity: Int = 1,
+    ) {
+        ensureConnected {
+            val params = PurchaseFlowParams.newBuilder()
+                .setProductId(productId)
+                .setProductType(productType)
+                .setQuantity(quantity)
+                .build()
+
+            // 결제창이 뜨면 이 앱은 백그라운드로 갑니다. 돌아올 때 [onResumed] 가 불리는데,
+            // 그때 회수를 돌리면 방금 산 구매의 후처리와 경합하므로 이 플래그로 건너뜁니다.
+            isPurchaseInProgress = true
+
+            log("launchPurchase: $productId type=$productType quantity=$quantity")
+            // 반환값은 "호출이 전달됐는지"만 알려줍니다. 결제 결과가 아닙니다.
+            purchaseClient?.launchPurchaseFlow(activity, params)
+        }
+    }
+
+    /**
+     * 화면이 다시 보이게 될 때 호출하세요 — 액티비티의 `onResume` 에서 부릅니다.
+     *
+     * **왜 필요한가:** 구매는 됐는데 소비·승인을 못 한 채 끝나는 경우가 있습니다 — 앱이 강제 종료됐거나,
+     * 네트워크가 끊겼거나, 후처리 요청이 실패한 경우입니다. 그대로 두면 **3일 뒤 자동 환불**되므로,
+     * 앱이 다시 보이는 시점마다 남은 것을 정리합니다.
+     *
+     * [start] 는 앱을 새로 시작할 때만 회수하므로, **백그라운드에서 돌아오는 경우는 이 함수가 없으면
+     * 회수되지 않습니다.**
+     *
+     * 아무것도 하지 않는 경우가 셋입니다 — 아직 [start] 전, 자동 후처리를 끈 경우(테스트 화면),
+     * 그리고 **결제가 진행 중일 때**(결제창에서 돌아오는 길이라 곧 [onPurchasesUpdated] 가 옵니다).
+     */
+    fun onResumed() {
+        // 건너뛴 이유를 남깁니다. 셋 다 정상 동작이지만, **회수가 안 돌았을 때 어느 조건에
+        // 걸렸는지 모르면 3일 뒤 환불의 원인을 찾을 수 없습니다.**
+        if (purchaseClient == null) {
+            log("onResumed: skipped — not started")
+            return
+        }
+        if (!autoProcessPurchases) {
+            log("onResumed: skipped — autoProcessPurchases=false")
+            return
+        }
+        if (isPurchaseInProgress) {
+            log("onResumed: skipped — purchase in progress")
+            return
+        }
+
+        log("onResumed: recovering pending purchases")
+        queryAndProcessPendingPurchases()
+    }
+
+    /**
+     * 후처리가 끝나지 않은 구매를 조회해 마무리합니다.
+     *
+     * **구매 후 3일 안에 소비 또는 승인하지 않으면 자동 환불됩니다.** 또 소비성 상품을 소비하지
+     * 않으면 재구매가 되지 않아 사용자가 막힙니다. 앱 시작 시점이나 로그인 직후에 호출하세요.
+     *
+     * 타입별로 **각각** 조회합니다 — [ProductType.ALL] 은 상품 정보 조회 전용이라 여기서는 쓸 수
+     * 없습니다. 한 타입이라도 빼면 그 상품의 최초 결제 승인이 유실됐을 때 복구할 곳이 없어집니다
+     * (결제 도중 앱이 종료된 경우 등).
+     *
+     * [ProductType.AUTO](월정액)는 **신규 생성이 중단된 타입**이지만, 이전에 만든 월정액 상품을
+     * 아직 파는 앱에는 남아 있습니다. 그런 상품이 없으면 빈 목록이 돌아올 뿐이므로 그대로 둡니다.
+     */
+    fun queryAndProcessPendingPurchases() {
+        listOf(ProductType.INAPP, ProductType.SUBS, ProductType.AUTO).forEach { productType ->
+            ensureConnected {
+                purchaseClient?.queryPurchasesAsync(productType) { iapResult, purchases ->
+                    if (!iapResult.isSuccess) {
+                        handleError(iapResult)
+                        return@queryPurchasesAsync
+                    }
+                    val pending = purchases ?: emptyList()
+                    if (pending.isNotEmpty()) {
+                        log("pending[$productType]: " + pending.joinToString { it.productId })
+                    }
+                    pending.forEach { handlePurchase(it, productType) }
+                }
+            }
+        }
+    }
+
+    /**
+     * 원스토어 로그인 화면을 띄웁니다. [Listener.onLoginRequired] 를 받았을 때 호출하세요.
+     *
+     * 로그인은 `GaaSignInClient` 가 담당합니다. `PurchaseClient.launchLoginFlowAsync` 는
+     * deprecated 이므로 쓰지 않습니다.
+     */
+    fun launchLoginFlow(activity: Activity) {
+        GaaSignInClient.getClient(activity).launchSignInFlow(activity) { signInResult ->
+            if (signInResult.isSuccessful) {
+                log("sign-in succeeded")
+                queryProductDetails()
+                // 구매 내역은 계정에 딸려 있습니다. 로그인 전에는 조회되지 않으므로
+                // 로그인 직후에 다시 회수해야 미처리 구매가 3일 뒤 환불되는 것을 막습니다.
+                if (autoProcessPurchases) {
+                    queryAndProcessPendingPurchases()
+                }
+            } else {
+                // 로그인 결과 코드는 결제 응답 코드와 체계가 다릅니다.
+                Log.w(TAG, "sign-in failed code=${signInResult.code} message=${signInResult.message}")
+                listener.onError(signInResult.code, signInResult.message)
+            }
+        }
+    }
+
+    /** 원스토어 앱 설치·업데이트 화면을 띄웁니다. [Listener.onUpdateRequired] 를 받았을 때 호출하세요. */
+    fun launchUpdateOrInstallFlow(activity: Activity) {
+        purchaseClient?.launchUpdateOrInstallFlow(activity) { iapResult ->
+            if (iapResult.isSuccess) {
+                ensureConnected { queryProductDetails() }
+            } else {
+                handleError(iapResult)
+            }
+        }
+    }
+
+    /** 결제 결과 콜백. [launchPurchase] 의 실제 결과가 여기로 옵니다. */
+    override fun onPurchasesUpdated(iapResult: IapResult, purchases: MutableList<PurchaseData>?) {
+        // 결제창이 닫혔습니다. 성공·실패·취소 어느 쪽이든 여기서 내립니다.
+        isPurchaseInProgress = false
+        log("onPurchasesUpdated: code=${iapResult.responseCode} count=${purchases?.size ?: 0}")
+
+        if (!iapResult.isSuccess) {
+            handleError(iapResult)
+            return
+        }
+
+        // 자동 처리를 끈 경우(테스트 화면)에는 후처리하지 않고 알리기만 합니다.
+        if (!autoProcessPurchases) {
+            purchases?.takeIf { it.isNotEmpty() }?.let { listener.onPurchasesNeedProcessing(it) }
+            return
+        }
+
+        // 상품 목록에 없는 상품이어도 건너뛰지 않습니다 — 후처리를 빠뜨리면 3일 뒤 자동 환불됩니다.
+        // 타입을 모를 때 무엇을 하는지는 handlePurchase 가 정합니다.
+        purchases?.forEach { purchase ->
+            handlePurchase(purchase, productTypeById[purchase.productId])
+        }
+    }
+
+    /**
+     * 구매 후처리. **구매 후 3일 안에 소비 또는 승인하지 않으면 미지급으로 판단해 자동 환불됩니다.**
+     *
+     * 어느 쪽을 부르는지는 상품 타입이 아니라 **상품의 역할**로 갈립니다.
+     * - 관리형(INAPP)이면서 소비성([CONSUMABLE_PRODUCT_IDS]) → 소비(consume). 재구매가 열립니다
+     * - 관리형이지만 영구성 → **승인(acknowledge)만.** 소비하면 다시 구매할 수 있게 되어 깨집니다
+     * - 구독(SUBS)·월정액(AUTO) → 승인. 구독은 최초 결제에만 필요합니다
+     */
+    private fun handlePurchase(purchase: PurchaseData, productType: String?) {
+        // 중복 지급 방지: 소비 요청은 실패할 수 있으므로 **소비 성공 응답을 받은 뒤에 지급**합니다.
+        //  이 매니저가 이미 그 구조입니다(consume 성공 콜백에서만 onPurchaseCompleted 를 부릅니다).
+        //  서버가 있으면 구매 토큰 사용 여부를 서버에서 확인하는 쪽이 더 강합니다.
+        //
+        // TODO: 서버가 상품을 지급하는 구조라면 여기서 구매 데이터를 앱 서버로 보내 검증하세요.
+        //  앱이 로컬에서만 처리한다면 해당 없습니다 — 서명은 SDK가 이미 검증했습니다.
+        val isConsumable = purchase.productId in CONSUMABLE_PRODUCT_IDS
+        // **어느 분기로 갔는지가 가장 자주 의심받는 자리입니다** — 소비성 지정이 틀리면 오류 없이
+        // 승인만 되고, 재구매가 막힌 원인을 코드를 읽어서는 찾기 어렵습니다.
+        log(
+            "handlePurchase: ${purchase.productId} type=${productType ?: "unknown"} " +
+                "consumable=$isConsumable acknowledged=${purchase.isAcknowledged}"
+        )
+
+        when {
+            // 타입을 모를 때도 소비성 목록에 있으면 소비합니다. 소비하지 않으면 재구매가 막힙니다.
+            isConsumable && (productType == null || productType == ProductType.INAPP) ->
+                consume(purchase)
+
+            // 이미 승인된 구매입니다. 회수가 돌 때마다(앱 시작·로그인 직후·이미 보유 응답) 여기로
+            // 다시 들어오므로, 지급이 **누적**되는 상품이면 같은 구매로 두 번 지급될 수 있습니다.
+            // TODO: purchaseToken 기준으로 이미 지급했는지 확인하고 나서 지급하세요.
+            //  영구성 상품처럼 플래그를 세우는 지급이면 여러 번 들어와도 무해합니다.
+            purchase.isAcknowledged -> listener.onPurchaseCompleted(purchase)
+
+            // 그 밖에는 모두 승인합니다 — **타입을 몰라도 승인은 합니다.**
+            // 아무것도 하지 않고 빠지면 3일 뒤 자동 환불되므로, 모르는 상품이라도 환불보다는
+            // 승인이 낫습니다. 소비성이었다면 나중에 consume 을 불러 되돌릴 수 있습니다.
+            else -> {
+                if (productType == null) {
+                    Log.w(TAG, "unknown product type, acknowledging: ${purchase.productId}")
+                }
+                acknowledge(purchase)
+            }
+        }
+    }
+
+    fun consume(purchase: PurchaseData) {
+        ensureConnected {
+            val params = ConsumeParams.newBuilder()
+                .setPurchaseData(purchase)
+                .build()
+
+            purchaseClient?.consumeAsync(params) { iapResult, consumed ->
+                if (iapResult.isSuccess) {
+                    log("consumed: ${purchase.productId}")
+                    listener.onPurchaseCompleted(consumed ?: purchase)
+                } else {
+                    // TODO: 소비 실패는 재시도하세요. 소비되지 않으면 상품이 지급되지 않습니다.
+                    handleError(iapResult)
+                }
+            }
+        }
+    }
+
+    fun acknowledge(purchase: PurchaseData) {
+        ensureConnected {
+            val params = AcknowledgeParams.newBuilder()
+                .setPurchaseData(purchase)
+                .build()
+
+            purchaseClient?.acknowledgeAsync(params) { iapResult, acknowledged ->
+                if (iapResult.isSuccess) {
+                    log("acknowledged: ${purchase.productId}")
+                    listener.onPurchaseCompleted(acknowledged ?: purchase)
+                } else {
+                    handleError(iapResult)
+                }
+            }
+        }
+    }
+
+    /**
+     * 응답 코드별 분기. 코드 의미는 공개 레퍼런스의 응답 코드 표를 보세요.
+     * https://onestore-dev.gitbook.io/dev/tools/billing/v21/references
+     */
+    private fun handleError(iapResult: IapResult) {
+        Log.w(TAG, "iap error code=${iapResult.responseCode} message=${iapResult.message}")
+
+        when (iapResult.responseCode) {
+            ResponseCode.RESULT_USER_CANCELED -> listener.onPurchaseCanceled()
+            ResponseCode.RESULT_NEED_LOGIN -> listener.onLoginRequired()
+            ResponseCode.RESULT_NEED_UPDATE -> listener.onUpdateRequired()
+
+            // 이미 보유한 상품입니다. 소비되지 않은 관리형 상품이 남아 있으면 여기서 회수해
+            // 후처리하면 재구매가 열립니다. 소비성/영구성 분기는 handlePurchase 가 하므로
+            // 영구성 상품은 승인만 되고 계속 보유 상태로 남습니다(그쪽은 정상 동작입니다).
+            ResponseCode.RESULT_ITEM_ALREADY_OWNED -> {
+                // 테스트 화면(autoProcessPurchases = false)에서는 돌리지 않습니다 —
+                // 버튼으로 직접 눌러 확인하려는 흐름이 사라집니다.
+                if (autoProcessPurchases) {
+                    queryAndProcessPendingPurchases()
+                }
+                listener.onError(iapResult.responseCode, iapResult.message)
+            }
+
+            else -> listener.onError(iapResult.responseCode, iapResult.message)
+        }
+    }
+}

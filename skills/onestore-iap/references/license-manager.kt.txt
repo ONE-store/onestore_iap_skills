@@ -1,0 +1,88 @@
+package __PACKAGE__
+
+import android.content.Context
+import android.util.Log
+import com.onestore.extern.licensing.AppLicenseChecker
+import com.onestore.extern.licensing.LicenseCheckerListener
+
+/**
+ * 원스토어 앱 라이선스 검증(ALC) 매니저. **유료 앱에만 필요합니다.**
+ *
+ * 무료 앱이거나 인앱결제만 쓰는 앱은 이 클래스도 `sdk-licensing` 의존성도 필요하지 않습니다.
+ * sdk-licensing 2.2.1 기준으로 작성됐고, 공개 샘플 앱의 구현 패턴을 따릅니다.
+ *
+ * ## 사용 순서
+ * 1. 앱 진입 시 [checkLicense] 호출
+ * 2. 결과는 [Listener] 로 전달됩니다
+ * 3. 종료 시 [release] 호출
+ *
+ * ## 반드시 확인할 TODO
+ * - `OneStoreLicenseKey` — 결제 매니저와 **같은 파일을 공유합니다.** 이미 채웠으면 다시 채우지 않습니다
+ * - [Listener] 구현 — 거부·오류일 때 앱을 어떻게 할지 결정
+ *
+ * 문서: https://onestore-dev.gitbook.io/dev
+ */
+class OneStoreLicenseManager(
+    private val context: Context,
+    private val listener: Listener,
+) : LicenseCheckerListener {
+
+    interface Listener {
+        /** 라이선스가 유효합니다 — 정상 진행하세요. */
+        fun onGranted(license: String?, signature: String?)
+
+        /** 정상 구매 이력이 없습니다. TODO: 구매 안내 후 기능 제한이나 종료를 결정하세요. */
+        fun onDenied()
+
+        /** 검증 자체가 실패했습니다(네트워크 등). TODO: 재시도할지 통과시킬지 정하세요. */
+        fun onError(code: Int, message: String?)
+    }
+
+    private companion object {
+        /** 결제 매니저와 **같은 태그**입니다 — `adb logcat -s OneStoreIAP` 로 함께 봅니다. */
+        private const val TAG = "OneStoreIAP"
+    }
+
+    private var licenseChecker: AppLicenseChecker? = null
+
+    /**
+     * 라이선스를 조회합니다.
+     *
+     * @param strict `true` 면 캐시를 쓰지 않고 매번 스토어에 확인합니다(`strictQueryLicense`).
+     *   `false` 면 캐시를 허용합니다(`queryLicense`) — 호출이 잦은 자리에 적합합니다.
+     */
+    fun checkLicense(strict: Boolean = true) {
+        val checker = licenseChecker
+            ?: AppLicenseChecker.get(context, OneStoreLicenseKey.get(), this)
+                .also { licenseChecker = it }
+
+        if (strict) {
+            checker.strictQueryLicense()
+        } else {
+            checker.queryLicense()
+        }
+    }
+
+    /** 리소스를 해제합니다. 액티비티·앱 종료 시 호출하세요. */
+    fun release() {
+        licenseChecker?.destroy()
+        licenseChecker = null
+    }
+
+    override fun granted(license: String?, signature: String?) {
+        // 라이선스 응답 본문과 서명은 찍지 않습니다 — 결과만 남깁니다.
+        Log.i(TAG, "license granted")
+        // 서명 검증은 SDK가 수행하지만, 중요한 판단은 서버에서 하는 것이 안전합니다.
+        listener.onGranted(license, signature)
+    }
+
+    override fun denied() {
+        Log.w(TAG, "license denied")
+        listener.onDenied()
+    }
+
+    override fun error(code: Int, message: String?) {
+        Log.w(TAG, "license error code=$code message=$message")
+        listener.onError(code, message)
+    }
+}
